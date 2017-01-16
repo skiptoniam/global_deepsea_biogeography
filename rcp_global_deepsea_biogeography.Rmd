@@ -5,6 +5,7 @@ date: "January 13, 2017"
 output: html_document
 ---
 
+Install required libraries to run RCPmod.
 ```{r setup}
 library(methods) # workaround so functions can be found when running via RScript
 library(Matrix) # sameo
@@ -12,5 +13,181 @@ library(glmnet) # sameo
 library(RCPmod) # normally, this is the only package you'll need to load, rest will load via namespace
 ```
 
+Import covariate data from fine scale rasters.
+```{r}
+library(rgdal)
+library(raster)
+library(dismo)
+rastwd <- 'T:/Ophiuroid Data/cosmos02/'
+files <- list.files(path = rastwd,pattern='asc', full.names=TRUE )
+wgs1984.proj <- CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+dep <- raster(files[1], crs=wgs1984.proj) #depth
+lat <- raster(files[2], crs=wgs1984.proj)
+lon <- raster(files[3], crs=wgs1984.proj) #lat#lat
+t <- raster(files[10], crs=wgs1984.proj) #temp
+tsd <- raster(files[11], crs=wgs1984.proj) #tempSD
+s <- raster(files[7], crs=wgs1984.proj) #salinity
+ssd <- raster(files[8], crs=wgs1984.proj) #SalSD
+o <- raster(files[6], crs=wgs1984.proj) #oxygen
+npp <- raster(files[5], crs=wgs1984.proj)
+svi <- raster(files[9], crs=wgs1984.proj)
+lutz <- raster(files[4], crs=wgs1984.proj)
 
+st <- stack(dep,lat,lon,t,tsd,s,ssd,o,npp,svi,lutz)
+x <- sum(st)
+st.mask <- mask(st,x)
+plot(st.mask)
 
+df <- st.mask[]
+df <- df[!is.na(df[,1]),]
+df <- as.data.frame(df)
+df$X <- df$lon02 
+df$Y <- df$lat02
+df <- df[,c(12,13,3,2,1,4:11)]
+colnames(df) <-c("X","Y","longitude","lat","depth","t","tsd","s","ssd","o","npp","svi","lutz")
+df<- df[,-12]
+df$depth <- df$depth*-1
+df$longitude <- df$longitude+180
+df$X <- df$X+180
+
+##Species data
+Global_Oph_spp <- read.csv("T:/Ophiuroid Data/Data/skip_records_24_1_14.csv")
+WhichSpp <- factor(Global_Oph_spp$taxa, exclude = NA)
+classes <- levels(WhichSpp)
+nClasses <- length(classes)
+
+Global_Oph_spp <- Global_Oph_spp[,c(4,3,6,7,8,20,21,22,23,24,14,15)]
+Global_Oph_spp <- Global_Oph_spp[order(Global_Oph_spp$taxa),]
+Global_Oph_spp$X <- Global_Oph_spp$Map.longitude
+Global_Oph_spp$Y <- Global_Oph_spp$Map.lat
+Global_Oph_spp <- Global_Oph_spp[,c(1,2,13,14,4,3,5:12)]
+colnames(Global_Oph_spp) <- c("Site.ID","Spp","X","Y","longitude","lat","depth","t","tsd","s","ssd","o","npp","lutz")
+Global_Oph_spp <- Global_Oph_spp[,-13]
+```
+
+Set-up species x sites matrix
+```{r}
+pts <- Global_Oph_spp
+
+# Remove duplicates
+dups <- duplicated(pts[c("Site.ID","Spp")])
+sum(dups)
+
+## remove duplicate records
+pts <- pts[!dups, ]
+
+no_occ = matrix(NA, nClasses,2)
+for (i in 1:nClasses){
+  Spp <- classes[i]
+  Count <-nrow(pts[pts$Spp==classes[i],])
+  no_occ[i,1] <- i
+  no_occ[i,2] <- Count
+}
+spp10 <- no_occ[no_occ[,2]>9,1]
+classes10 <- classes[spp10]
+pts10 <- pts[pts$Spp%in%classes10,]
+WhichSpp10 = factor(pts10$Spp, exclude = NA)
+classes10 = levels(WhichSpp10)
+nClasses10 = length(classes10)
+
+table2mat <- function (x, site.id = "site.id", sp.id = "sp.id", abund = FALSE, abund.col = " No.of.specimens",siteXsp=TRUE) 
+{
+  a <- site.id
+  nr <- length(levels(as.factor(x[, a])))
+  rn <- levels(as.factor(x[, a]))
+  z <- sp.id
+  cn <- levels(as.factor(x[, z]))
+  nc <- length(cn)
+  nm <- matrix(0, nr, nc, dimnames = list(rn, cn))
+  for (i in 1:length(x[, 1])) {
+    m <- as.character(x[i, a])
+    n <- as.character(x[i, z])
+    if (is.na(m) == TRUE | is.null(m) == TRUE | is.na(n) == 
+          TRUE | is.null(n) == TRUE) 
+      (next)(i)
+    if (m == "" | m == " " | n == "" | n == " ") 
+      (next)(i)
+    if (abund == TRUE) 
+      nm[m, n] <- nm[m, n] + x[i, abund.col]
+    else nm[m, n] <- 1
+  }
+  fm <- nm[rowSums(nm) > 0, ]
+  if(siteXsp){ return(as.matrix(fm))
+  } else {
+    return(as.matrix(t(fm)))
+  }
+}
+
+pts10$Spp <- factor(pts10$Spp)
+global_pa_mat <- table2mat(pts10,"Site.ID","Spp")
+```
+
+Set up covariate data for RCP models
+```{r}
+library(plyr)
+covar.site.mn <- ddply(pts10,.(Site.ID),summarize,lon=mean(longitude,na.rm = T),lat=mean(latitude,na.rm = T),dep=mean(depth,na.rm=T),t=mean(t,na.rm=T),tsd=mean(tsd,na.rm=T),s=mean(s,na.rm=T),ssd=mean(ssd,na.rm=T),o=mean(o,na.rm=T),lutz=mean(lutz,na.rm=T))
+
+model.covariates.string = 'lon.1+lon.2+lat.1+lat.2+dep.1+dep.2+t.1+t.2+tsd.1+tsd.2+s.1+s.2+ssd.1+ssd.2+o.1+o.2+lutz.1+lutz.2'
+model.covariates.vector = c("lon","lat","dep","t","tsd","s","ssd","o","lutz")
+
+covar.data <- na.omit(covar.site.mn)
+species.data <- global_pa_mat[rownames(global_pa_mat)%in%covar.data$Site.ID,]
+
+# calculate quadratic polynomial cols
+covar.data = data.frame(poly(covar.data$lon, 2),
+                        poly(covar.data$lat, 2),
+                        poly(covar.data$dep, 2),
+                        poly(covar.data$t, 2),
+                        poly(covar.data$tsd, 2),
+                        poly(covar.data$s, 2),
+                        poly(covar.data$ssd, 2),
+                        poly(covar.data$o, 2),
+                        poly(covar.data$lutz, 2))
+
+names(covar.data) = c('lon.1','lon.2',
+                      'lat.1','lat.2',
+                      'dep.1','dep.2',
+                      't.1','t.2',
+                      'tsd.1','tsd.2',
+                      's.1','s.2',
+                      'ssd.1','ssd.2',
+                      'o.1','o.2',
+                      'lutz.1','lutz.2')
+
+nspp <- ncol(species.data)
+model.data = data.frame(species.data,const=1, covar.data)
+model.species.string <- colnames(species.data)
+
+RCP.form = paste0('cbind(',paste0(colnames(model.data[,1:nspp]),collapse=','),')~',paste0(colnames(model.data[,c(nspp+2):ncol(model.data)]),collapse = '+'))
+
+# this part will add covariates that inform collection method(s).
+# add column containing factor for form.spp
+# e.g. model.data$observer = as.factor(covariates.species$Observers)
+# model.data$score.method = as.factor(covariates.species$Species.score.method)
+# model.data$date.int = scale(as.integer(covariates.species$Date), center=T, scale=T)
+
+# define species form
+# # e.g. "~Observer"
+# species.form = "~score.method+date.int"
+```
+
+```{r}
+gc()
+
+nRCP = 10
+# fit mixture models ------------------------------------------------------
+my.cont = list(maxit=3000, penalty=0.0001, penalty.tau=10, penalty.gamma=10)
+
+tic = proc.time()
+fit.regi = regimix(form.RCP=RCP.form, form.spp=NULL, data=model.data, nRCP=nRCP, 
+                     dist="Bernoulli", control=my.cont, inits="noPreClust", titbits=TRUE)
+toc = proc.time()
+  
+# write model fit stats
+model_stats=list(covariates=model.covariates.vector, species=colnames(model.data[,1:nspp]), 
+                  nspp=nspp, nRCP=fit.regi$nRCP, runtime=round((toc-tic)[3]/60),
+                  AIC=fit.regi$AIC, BIC=fit.regi$BIC, postProbs=fit.regi$postProbs, logl=fit.regi$logl, 
+                  coefs=fit.regi$coefs, penalties=unlist(my.cont), conv=fit.regi$conv)
+save(model_stats, file=paste0("./results/regimix_stats.n",fit.regi$n,
+                               ".rcp",fit.regi$nRCP,".s",fit.regi$S,round(fit.regi$logl),".RData"))
+```
